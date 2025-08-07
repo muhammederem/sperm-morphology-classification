@@ -1,0 +1,18 @@
+model:
+  base_model: resnet50
+  num_classes: 3
+
+training:
+  batch_size: 32
+  epochs: 30
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  device: cuda
+  seed: 42
+
+paths:
+  data_dir: "/Users/erem/Documents/master/Boya1"
+  logs_dir: "/Users/erem/Documents/master/boya/logs"
+  models_dir: "/Users/erem/Documents/master/boya/models"
+  results_dir: "/Users/erem/Documents/master/boya/results"
+  tensorboard_runs_dir: "/Users/erem/Documents/master/boya/runs"
