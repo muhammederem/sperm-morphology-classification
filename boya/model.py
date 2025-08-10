@@ -1,34 +1,26 @@
-import torch
-import torch.nn as nn
-from torchvision import models
+"""
+Main model factory for the Boya project.
+This module provides a unified interface to create models from the models package.
+"""
 
+from models import create_model as create_model_from_package
 
-class BilinearCNN(nn.Module):
-    def __init__(self, base_model, num_classes):
-        super(BilinearCNN, self).__init__()
-        # ResNet50’den son iki katmanı at (avgpool ve fc)
-        self.features = nn.Sequential(*list(base_model.children())[:-2])
-        self.fc_dim = 2048  # ResNet50'de son katmanın kanal sayısı
-        self.classifier = nn.Linear(self.fc_dim * self.fc_dim, num_classes)
-
-    def bilinear_pooling(self, x):
-        # x: (batch, channels, height, width)
-        batch_size, ch, h, w = x.size()
-        x = x.view(batch_size, ch, h * w)
-        x = torch.bmm(x, x.transpose(1, 2)) / (h * w)  # Bilinear outer product
-        x = x.view(batch_size, -1)
-        x = torch.sign(x) * torch.sqrt(torch.abs(x) + 1e-10)  # Signed sqrt
-        x = nn.functional.normalize(x)  # L2 norm
-        return x
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.bilinear_pooling(x)
-        x = self.classifier(x)
-        return x
-
-
-def create_model(num_classes):
-    base_model = models.resnet50(pretrained=True)
-    model = BilinearCNN(base_model, num_classes)
-    return model
+def create_model(num_classes, model_name='resnet50', use_bilinear_pooling=True, pretrained=True):
+    """
+    Create a model with specified configuration
+    
+    Args:
+        num_classes: Number of output classes
+        model_name: Name of the base model (e.g., 'resnet50', 'efficientnet_b0', 'densenet121')
+        use_bilinear_pooling: Whether to use bilinear pooling
+        pretrained: Whether to use pretrained weights
+    
+    Returns:
+        The created model
+    """
+    return create_model_from_package(
+        num_classes=num_classes,
+        model_name=model_name,
+        use_bilinear_pooling=use_bilinear_pooling,
+        pretrained=pretrained
+    )

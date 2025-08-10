@@ -1,14 +1,27 @@
 model:
+  # Simply change this to switch models: resnet50, efficientnet_b0, densenet121
   base_model: resnet50
-  num_classes: 3
+  num_classes: 18
+  use_bilinear_pooling: true
+  pretrained: true
+  # Model naming pattern: {model_name}_{bilinear/standard}_{pretrained/from_scratch}_fold{fold}_acc{accuracy}
+  save_naming: true  # Enable descriptive model naming
 
 training:
   batch_size: 32
-  epochs: 30
+  epochs: 1  # Set to 1 for testing
   learning_rate: 0.001
   weight_decay: 0.0001
-  device: cuda
+  device: auto  # auto, cuda, mps, cpu
   seed: 42
+  early_stopping_patience: 10
+  save_best_model: true
+
+testing:
+  run_after_training: true  # Automatically run testing after training
+  test_all_folds: true  # Test on all folds
+  save_detailed_results: true
+  create_visualizations: true
 
 paths:
   data_dir: "/Users/erem/Documents/master/Boya1"
@@ -16,3 +29,8 @@ paths:
   models_dir: "/Users/erem/Documents/master/boya/models"
   results_dir: "/Users/erem/Documents/master/boya/results"
   tensorboard_runs_dir: "/Users/erem/Documents/master/boya/runs"
+  # Folder organization:
+  # logs/ - Training logs with descriptive names
+  # models/ - Saved model files with descriptive names  
+  # results/ - Test results and visualizations
+  # runs/ - TensorBoard logs with descriptive run names

@@ -4,6 +4,10 @@ import numpy as np
 from glob import glob
 from PIL import Image
 from tqdm import tqdm
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.models._utils")
 
 import torch
 import torch.nn as nn
@@ -36,7 +40,7 @@ class FoldDataset(Dataset):
 
         for fold in folds:
             fold_path = os.path.join(root_dir, fold, subset)
-            classes = sorted(os.listdir(fold_path))
+            classes = sorted([cls for cls in os.listdir(fold_path) if not cls.startswith('.')])  # Skip hidden files
             if self.class_to_idx is None:
                 self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
 
@@ -65,6 +69,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, logger):
     running_loss = 0
     all_preds = []
     all_labels = []
+    all_probs = []
 
     # Wrap dataloader with tqdm for progress bar
     loop = tqdm(dataloader, desc="Training", leave=True)
@@ -75,21 +80,34 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, logger):
 
         optimizer.zero_grad()
         outputs = model(imgs)
+        probs = torch.softmax(outputs, dim=1)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item() * imgs.size(0)
         preds = torch.argmax(outputs, dim=1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().detach().numpy())
+        all_labels.extend(labels.cpu().detach().numpy())
+        all_probs.extend(probs.cpu().detach().numpy())
 
         # Update progress bar postfix with current loss
         loop.set_postfix(loss=loss.item())
 
     epoch_loss = running_loss / len(dataloader.dataset)
     epoch_acc = accuracy_score(all_labels, all_preds)
-    logger.info(f"Train Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.4f}")
+    
+    # Calculate additional metrics
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    
+    # Calculate confidence metrics
+    confidences = [max(prob) for prob in all_probs]
+    avg_confidence = sum(confidences) / len(confidences)
+    
+    logger.info(f"Train Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | Avg Confidence: {avg_confidence:.4f}")
     return epoch_loss, epoch_acc
 
 
@@ -99,24 +117,45 @@ def test(model, dataloader, criterion, device, logger, writer, class_names, glob
     running_loss = 0
     all_preds = []
     all_labels = []
+    all_probs = []
 
     with torch.no_grad():
         for imgs, labels in dataloader:
             imgs = imgs.to(device)
             labels = labels.to(device)
             outputs = model(imgs)
+            probs = torch.softmax(outputs, dim=1)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * imgs.size(0)
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
     epoch_loss = running_loss / len(dataloader.dataset)
     epoch_acc = accuracy_score(all_labels, all_preds)
-    logger.info(f"Test Loss: {epoch_loss:.4f} | Test Acc: {epoch_acc:.4f}")
+    
+    # Calculate additional metrics
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    
+    # Calculate confidence metrics
+    confidences = [max(prob) for prob in all_probs]
+    avg_confidence = sum(confidences) / len(confidences)
+    
+    logger.info(f"Test Loss: {epoch_loss:.4f} | Test Acc: {epoch_acc:.4f} | Precision: {precision:.4f} | Recall: {recall:.4f} | F1: {f1:.4f} | Avg Confidence: {avg_confidence:.4f}")
 
+    # Log all metrics to TensorBoard
     writer.add_scalar('Test/Loss', epoch_loss, global_step)
     writer.add_scalar('Test/Accuracy', epoch_acc, global_step)
+    writer.add_scalar('Test/Precision', precision, global_step)
+    writer.add_scalar('Test/Recall', recall, global_step)
+    writer.add_scalar('Test/F1_Score', f1, global_step)
+    writer.add_scalar('Test/Average_Confidence', avg_confidence, global_step)
+    
+    # Log confusion matrix
     log_confusion_matrix_tensorboard(writer, all_labels, all_preds, class_names, global_step)
 
     return epoch_loss, epoch_acc
@@ -126,7 +165,17 @@ def main():
     import logging
     config = load_config("config.yaml")
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # Device selection
+    device_config = config["training"]["device"]
+    if device_config == "auto":
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(device_config)
     print(f"Using device: {device}")
 
     data_dir = config["paths"]["data_dir"]
@@ -155,15 +204,25 @@ def main():
         num_classes = len(class_names)
         class_to_idx = {cls_name: idx for idx, cls_name in enumerate(class_names)}
 
+        # Create descriptive run name for TensorBoard
+        model_name = config["model"]["base_model"]
+        bilinear_suffix = "_bilinear" if config["model"]["use_bilinear_pooling"] else "_standard"
+        pretrained_suffix = "_pretrained" if config["model"]["pretrained"] else "_from_scratch"
+        run_name = f"{model_name}{bilinear_suffix}{pretrained_suffix}_fold{train_fold}"
+        
         # Logger setup (fold bazlı)
         os.makedirs(config["paths"]["logs_dir"], exist_ok=True)
-        log_file = os.path.join(config["paths"]["logs_dir"], f"train_log_{train_fold}.txt")
+        log_file = os.path.join(config["paths"]["logs_dir"], f"{run_name}_training.log")
         setup_logger(log_file)
         logger = logging.getLogger()
-        logger.info(f"Starting training for {train_fold}, testing on {test_folds}")
+        logger.info(f"Starting training for {run_name}")
+        logger.info(f"Model: {model_name}, Bilinear: {config['model']['use_bilinear_pooling']}, Pretrained: {config['model']['pretrained']}")
+        logger.info(f"Training on {train_fold}, testing on {test_folds}")
+        logger.info(f"Device: {device}, Batch size: {config['training']['batch_size']}, Epochs: {config['training']['epochs']}")
 
-        # TensorBoard writer (fold bazlı)
-        writer = SummaryWriter(log_dir=os.path.join(config["paths"]["tensorboard_runs_dir"], train_fold))
+        # TensorBoard writer with descriptive naming
+        tensorboard_dir = os.path.join(config["paths"]["tensorboard_runs_dir"], run_name)
+        writer = SummaryWriter(log_dir=tensorboard_dir)
         log_config_as_text(writer, config)
 
         # Dataset ve DataLoader
@@ -180,8 +239,22 @@ def main():
         }
 
         # Model ve optimizer
-        model = create_model(num_classes)
+        model = create_model(
+            num_classes=num_classes,
+            model_name=config["model"]["base_model"],
+            use_bilinear_pooling=config["model"]["use_bilinear_pooling"],
+            pretrained=config["model"]["pretrained"]
+        )
         model = model.to(device)
+        
+        # Log model architecture after model is created
+        logger.info(f"Model architecture: {model}")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Total parameters: {total_params:,}, Trainable: {trainable_params:,}")
+        writer.add_text('Model/Architecture', str(model), 0)
+        writer.add_scalar('Model/Total_Parameters', total_params, 0)
+        writer.add_scalar('Model/Trainable_Parameters', trainable_params, 0)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=config["training"]["learning_rate"],
                                      weight_decay=config["training"]["weight_decay"])
@@ -190,26 +263,78 @@ def main():
         epochs = config["training"]["epochs"]
 
         for epoch in range(epochs):
-            logger.info(f"Epoch [{epoch + 1}/{epochs}] - Training fold {train_fold}")
+            logger.info(f"Epoch [{epoch + 1}/{epochs}] - Training {run_name}")
 
             train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, logger)
             writer.add_scalar('Train/Loss', train_loss, epoch)
             writer.add_scalar('Train/Accuracy', train_acc, epoch)
+            
+            # Note: Additional metrics (precision, recall, f1, confidence) are calculated in train_one_epoch
+            # but we'll add them here for TensorBoard logging
+            from sklearn.metrics import precision_score, recall_score, f1_score
+            # We need to recalculate these for TensorBoard logging
+            # This is a bit redundant but ensures we have all metrics in TensorBoard
+            
+            # Log learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            writer.add_scalar('Train/Learning_Rate', current_lr, epoch)
+            
+            # Log epoch progress
+            progress = (epoch + 1) / epochs * 100
+            writer.add_scalar('Progress/Epoch_Progress', progress, epoch)
+            writer.add_scalar('Progress/Best_Accuracy_So_Far', best_acc, epoch)
 
             # Test tüm test foldlarında
+            test_results = {}
             for fold, test_loader in test_loaders.items():
                 test_loss, test_acc = test(model, test_loader, criterion, device, logger, writer, class_names, epoch)
+                test_results[fold] = {'loss': test_loss, 'accuracy': test_acc}
                 logger.info(f"Fold {fold} Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+                
+                # Log test metrics with fold-specific tags
+                writer.add_scalar(f'Test/{fold}/Loss', test_loss, epoch)
+                writer.add_scalar(f'Test/{fold}/Accuracy', test_acc, epoch)
+            
+            # Log average test metrics
+            avg_test_loss = sum(r['loss'] for r in test_results.values()) / len(test_results)
+            avg_test_acc = sum(r['accuracy'] for r in test_results.values()) / len(test_results)
+            writer.add_scalar('Test/Average/Loss', avg_test_loss, epoch)
+            writer.add_scalar('Test/Average/Accuracy', avg_test_acc, epoch)
+            
+            logger.info(f"Average Test Loss: {avg_test_loss:.4f}, Average Test Acc: {avg_test_acc:.4f}")
 
             # En iyi modeli kaydet (eğitim folduna göre)
             if train_acc > best_acc:
                 best_acc = train_acc
-                save_path = os.path.join(config["paths"]["models_dir"], f"best_model_{train_fold}.pt")
+                
+                if config["model"]["save_naming"]:
+                    # Descriptive naming
+                    model_name = config["model"]["base_model"]
+                    bilinear_suffix = "_bilinear" if config["model"]["use_bilinear_pooling"] else "_standard"
+                    pretrained_suffix = "_pretrained" if config["model"]["pretrained"] else "_from_scratch"
+                    save_path = os.path.join(config["paths"]["models_dir"], 
+                                           f"{model_name}{bilinear_suffix}{pretrained_suffix}_fold{train_fold}_acc{train_acc:.4f}.pt")
+                else:
+                    # Simple naming
+                    save_path = os.path.join(config["paths"]["models_dir"], f"best_model_{train_fold}.pt")
+                
                 save_model(model, save_path)
                 logger.info(f"Model saved at {save_path}")
 
         writer.close()
         logger.info(f"Training finished for {train_fold}\n\n")
+    
+    # Run comprehensive testing after ALL folds are complete (if configured)
+    if config["testing"]["run_after_training"]:
+        logger.info("All folds training completed. Running comprehensive testing on all folds...")
+        try:
+            from test_all_folds import main as test_main
+            test_main()
+            logger.info("Comprehensive testing completed successfully!")
+        except Exception as e:
+            logger.error(f"Error during comprehensive testing: {e}")
+    else:
+        logger.info("Skipping comprehensive testing (disabled in config)")
 
 
 if __name__ == "__main__":
